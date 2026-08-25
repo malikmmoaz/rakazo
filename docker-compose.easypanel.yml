@@ -1,10 +1,16 @@
 # Rakazo on Easypanel.
 #
+# Uses the published image ghcr.io/elie222/rakazo/app, so nothing is built on
+# the server. Pin RAKAZO_IMAGE_TAG to a sha-<commit> tag for reproducible
+# deploys; `edge` tracks upstream main.
+#
 # Differences from docker-compose.prod.yml:
 #   - no caddy service and no published ports; Easypanel's Traefik owns 80/443
 #     and terminates TLS. Route one Easypanel domain to service `web`, port 5173.
 #   - no env_file; every value comes from Easypanel's Environment tab so secrets
 #     stay in the panel and never land in the repository.
+#   - no updater sidecar; it needs the Docker socket and a host bind-mount.
+#     Redeploy from Easypanel instead.
 #
 # Required Easypanel environment variables:
 #   RAKAZO_HOST, POSTGRES_PASSWORD, BETTER_AUTH_SECRET, ENCRYPTION_KEY,
@@ -12,7 +18,7 @@
 
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16@sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -31,11 +37,7 @@ services:
       retries: 20
 
   api:
-    build:
-      context: .
-      dockerfile: infra/compose/Dockerfile
-      args:
-        GIT_SHA: ${GIT_SHA:-}
+    image: ${RAKAZO_IMAGE:-ghcr.io/elie222/rakazo/app}:${RAKAZO_IMAGE_TAG:-edge}
     restart: unless-stopped
     command:
       - bash
@@ -90,9 +92,7 @@ services:
       retries: 30
 
   worker:
-    build:
-      context: .
-      dockerfile: infra/compose/Dockerfile
+    image: ${RAKAZO_IMAGE:-ghcr.io/elie222/rakazo/app}:${RAKAZO_IMAGE_TAG:-edge}
     restart: unless-stopped
     command: ["pnpm", "--filter", "@rakazo/worker", "start"]
     init: true
@@ -132,9 +132,7 @@ services:
         condition: service_healthy
 
   web:
-    build:
-      context: .
-      dockerfile: infra/compose/Dockerfile
+    image: ${RAKAZO_IMAGE:-ghcr.io/elie222/rakazo/app}:${RAKAZO_IMAGE_TAG:-edge}
     restart: unless-stopped
     command: ["pnpm", "--filter", "@rakazo/web", "preview", "--host", "0.0.0.0", "--port", "5173"]
     init: true
