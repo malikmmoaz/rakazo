@@ -152,11 +152,16 @@ services:
     expose:
       - "5173"
     networks:
+      # Easypanel's Traefik dials {project}_{service}_{composeService}, but
+      # Compose names containers {project}-{service}-{index}. Without this
+      # alias the proxy target does not resolve and every request 502s.
       default:
         aliases:
-          # Easypanel's Traefik dials {project}_{service}_{composeService}, but
-          # Compose names containers {project}-{service}-{index}. Without this
-          # alias the proxy target does not resolve and every request 502s.
+          - ${WEB_NETWORK_ALIAS:-claude_rakazo_web}
+      # Traefik runs outside this project, so `web` has to join its network too.
+      # Only `web` does; postgres, api, and worker stay private.
+      proxy:
+        aliases:
           - ${WEB_NETWORK_ALIAS:-claude_rakazo_web}
     depends_on:
       api:
@@ -165,3 +170,12 @@ services:
 volumes:
   pgdata:
   appdata:
+
+networks:
+  default: {}
+  # Easypanel's proxy network. Set EASYPANEL_NETWORK in the panel if this
+  # server names it something else; `docker network ls` on the host is
+  # authoritative.
+  proxy:
+    external: true
+    name: ${EASYPANEL_NETWORK:-easypanel-overlay}
