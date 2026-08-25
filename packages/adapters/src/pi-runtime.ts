@@ -1,5 +1,12 @@
 import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
-import { type Api, type Model, type Models, Type } from "@earendil-works/pi-ai";
+import {
+  type Api,
+  clampThinkingLevel,
+  type Model,
+  type Models,
+  type ModelThinkingLevel,
+  Type,
+} from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import type {
   AdapterContext,
@@ -32,9 +39,14 @@ const MAX_PARALLEL_SUBAGENTS = 4;
 // that to reasoning.effort "none", which 400s on endpoints that mandate
 // reasoning (e.g. google/gemini-3.7-flash). Keep a real level when model.reasoning
 // is set; plain models stay off.
-const REASONING_MODEL_THINKING_LEVEL = "medium";
-function thinkingLevelFor(model: { reasoning?: boolean }) {
-  return model.reasoning ? REASONING_MODEL_THINKING_LEVEL : "off";
+const REASONING_MODEL_THINKING_LEVEL: ModelThinkingLevel = "medium";
+function thinkingLevelFor(
+  model: Model<Api>,
+  preferred?: ModelThinkingLevel | null,
+): ModelThinkingLevel {
+  if (!model.reasoning) return "off";
+  if (preferred) return clampThinkingLevel(model, preferred);
+  return clampThinkingLevel(model, REASONING_MODEL_THINKING_LEVEL);
 }
 // Pi forwards these names to OpenAI Responses, whose function-name contract is
 // ^[a-zA-Z0-9_-]+$ with a maximum length of 64 characters.
@@ -127,7 +139,7 @@ export class PiAgentRuntime implements AgentRuntime {
                 ? "You are a Rakazo bot with a real computer. Use computer_observe and computer_act to operate its visible desktop, including browsers and installed applications. Use shell and the file tools for precise terminal and filesystem work. The user may interact with the same desktop while you run, so re-observe when the screen may have changed. Be concise."
                 : "You are a Rakazo bot with a persistent sandbox filesystem and shell. Be concise."),
             model,
-            thinkingLevel: thinkingLevelFor(model),
+            thinkingLevel: thinkingLevelFor(model, request.model.thinkingLevel),
             tools,
             messages: history,
           },
@@ -333,6 +345,12 @@ export function describeToolActivity(toolName: string, args: unknown): string {
   if (toolName === "computer_act") return "Operating the computer";
   if (toolName === "run_subagent") return `Delegating to helper: ${detail(record.name)}`;
   if (toolName === "remember") return "Saving a note to memory";
+  if (toolName === "skill_read") return `Reading skill: ${detail(record.name)}`;
+  if (toolName === "skill_create") return `Creating skill: ${detail(record.name ?? "skill")}`;
+  if (toolName === "skill_update")
+    return `Updating skill: ${detail(record.name ?? record.skillId)}`;
+  if (toolName === "skill_delete")
+    return `Deleting skill: ${detail(record.name ?? record.skillId)}`;
   const mcp = toolName.match(/^mcp__(.+?)__(.+)$/);
   if (mcp) return `Using ${mcp[1]}: ${mcp[2]}`;
   return `Using ${toolName}`;
@@ -542,7 +560,7 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
         .filter(Boolean)
         .join(" "),
       model: host.model,
-      thinkingLevel: thinkingLevelFor(host.model),
+      thinkingLevel: thinkingLevelFor(host.model, host.request.model.thinkingLevel),
       tools: toAgentTools(childDefs, nestedHost),
       messages: [],
     },

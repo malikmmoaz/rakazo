@@ -32,9 +32,12 @@ import {
   enqueueTakeoverContinuation,
   expireComputerControl,
   hasActiveComputerControl,
+  isScratchpadStatus,
   listPiCatalog,
+  listScratchpadItems,
   McpOAuthBroker,
   type MemoryProviderResolver,
+  mapScratchpadItem,
   modelCredentialDto,
   type PiOAuthLogins,
   planLiveConnectionSync,
@@ -71,6 +74,7 @@ import {
   ACTIVE_RUN_STATUSES,
   AttachmentValidationError,
   containsSecret,
+  expandSkillReferencesInPrompt,
   isOneShotRoutineCron,
   nextCronDate,
 } from "@rakazo/core";
@@ -92,8 +96,13 @@ import {
   type ThreadEvents,
   touchGroupUpdatedAt,
 } from "@rakazo/db";
+import { createAgentSkillsService } from "./agent-skills.js";
 import { createOwnedArtifact, getOwnedArtifact, getWorkspaceArtifact } from "./artifacts.js";
-import { toComputerStatus } from "./computer-status.js";
+import {
+  executionBlocksUserTakeover,
+  resolveBusyBotName,
+  toComputerStatus,
+} from "./computer-status.js";
 import { buildMcpUpdateMaterial } from "./mcp-material.js";
 import { chooseFocus, markAppConnected, startOnboarding } from "./onboarding.js";
 import { addScreenProxyCapability } from "./screen-proxy.js";
@@ -310,6 +319,7 @@ export function createRouter(deps: RouterDeps) {
     home: deps.home,
     dataDir: deps.dataDir,
   });
+  const agentSkills = createAgentSkillsService(deps.prisma);
 
   const authed = os.use(async ({ context, next }) => {
     if (!context.actor) throw new ORPCError("UNAUTHORIZED");
@@ -532,6 +542,9 @@ export function createRouter(deps: RouterDeps) {
           notifyOnFinish: source.notifyOnFinish,
           color: source.color,
           computerMode: source.computer?.scope === "dedicated" ? "dedicated" : "team",
+          modelProvider: source.modelProvider,
+          modelId: source.modelId,
+          thinkingLevel: source.thinkingLevel,
         });
         const assignments = await deps.prisma.botMcpServer.findMany({
           where: {
@@ -555,7 +568,7 @@ export function createRouter(deps: RouterDeps) {
         return duplicate;
       }),
       update: authed.bots.update.handler(async ({ context, input }) => {
-        await repos.getBot(context.actor, input.botId);
+        const existing = await repos.getBot(context.actor, input.botId);
         if (input.sectionId) {
           const section = await deps.prisma.botSection.findFirst({
             where: {
@@ -566,6 +579,46 @@ export function createRouter(deps: RouterDeps) {
             select: { id: true },
           });
           if (!section) throw new IsolationError();
+        }
+        if (input.modelProvider && input.modelId) {
+          const credential = await deps.prisma.userModelCredential.findFirst({
+            where: {
+              userId: context.actor.userId,
+              workspaceId: context.actor.workspaceId,
+              provider: input.modelProvider,
+            },
+            orderBy: newestModelCredentialOrder,
+          });
+          if (!credential) {
+            throw new ORPCError("BAD_REQUEST", { message: "Connect that model provider first" });
+          }
+          const knownModels = [...listPiCatalog(), scriptedCatalogEntry];
+          const inCatalog = knownModels.some(
+            (item) => item.provider === input.modelProvider && item.id === input.modelId,
+          );
+          if (!inCatalog && credential.defaultModel !== input.modelId) {
+            throw new ORPCError("BAD_REQUEST", { message: "Unknown model for that provider" });
+          }
+        }
+        const thinkingLevel = input.thinkingLevel;
+        if (input.thinkingLevel) {
+          const provider =
+            input.modelProvider !== undefined ? input.modelProvider : existing.modelProvider;
+          const modelId = input.modelId !== undefined ? input.modelId : existing.modelId;
+          const me = await meDto(deps, context.actor);
+          const effectiveProvider = provider ?? me.defaultProvider;
+          const effectiveModelId = modelId ?? me.defaultModel;
+          if (effectiveProvider && effectiveModelId) {
+            const entry = listPiCatalog().find(
+              (item) => item.provider === effectiveProvider && item.id === effectiveModelId,
+            );
+            const allowed = entry?.thinkingLevels;
+            if (allowed && !allowed.includes(input.thinkingLevel)) {
+              throw new ORPCError("BAD_REQUEST", {
+                message: `Thinking level must be one of: ${allowed.join(", ")}`,
+              });
+            }
+          }
         }
         await deps.prisma.bot.update({
           where: { id: input.botId },
@@ -581,6 +634,10 @@ export function createRouter(deps: RouterDeps) {
             sectionId: input.sectionId,
             voiceId: input.voiceId,
             autoSpeak: input.autoSpeak,
+            ...(input.modelProvider !== undefined
+              ? { modelProvider: input.modelProvider, modelId: input.modelId ?? null }
+              : {}),
+            ...(input.thinkingLevel !== undefined ? { thinkingLevel } : {}),
           },
         });
         const bots = await repos.listBots(context.actor);
@@ -1102,23 +1159,29 @@ export function createRouter(deps: RouterDeps) {
         const executionLease = await deps.prisma.computerExecutionLease.findUnique({
           where: { computerId_botId: { computerId: bot.computer.id, botId: bot.id } },
         });
-        const executionLeaseActive = Boolean(
-          executionLease && executionLease.expiresAt.getTime() > Date.now(),
-        );
         const executionRun = executionLease
           ? await deps.prisma.run.findUnique({
               where: { id: executionLease.runId },
               select: { botId: true, status: true },
             })
           : null;
+        const waitingForTakeover =
+          executionRun?.botId === bot.id && executionRun.status === "waiting_takeover";
+        if (
+          executionBlocksUserTakeover({
+            hasLease: Boolean(executionLease),
+            leaseExpiresAt: executionLease?.expiresAt,
+            runStatus: executionRun?.status,
+          })
+        ) {
+          throw new ORPCError("CONFLICT", { message: "Stop the bot first" });
+        }
+        const executionLeaseActive = Boolean(
+          executionLease && executionLease.expiresAt.getTime() > Date.now(),
+        );
         const executionRunActive = Boolean(
           executionRun && ACTIVE_RUN_STATUSES.some((status) => status === executionRun.status),
         );
-        const waitingForTakeover =
-          executionRun?.botId === bot.id && executionRun.status === "waiting_takeover";
-        if (executionLease && !waitingForTakeover && (executionLeaseActive || executionRunActive)) {
-          throw new ORPCError("CONFLICT", { message: "Stop the bot first" });
-        }
         if (executionLease && !executionLeaseActive && !executionRunActive) {
           await deps.prisma.computerExecutionLease.deleteMany({
             where: { id: executionLease.id },
@@ -1621,13 +1684,15 @@ export function createRouter(deps: RouterDeps) {
         if (!routine) throw new IsolationError();
         const bot = await repos.getBot(context.actor, routine.botId);
         if (!bot.thread) throw new IsolationError();
+        const skillRecords = await agentSkills.listWithContent(context.actor);
+        const prompt = expandSkillReferencesInPrompt(routine.prompt, skillRecords);
         const task = await deps.prisma.task.create({
           data: {
             workspaceId: context.actor.workspaceId,
             botId: bot.id,
             threadId: bot.thread.id,
             userId: context.actor.userId,
-            prompt: routine.prompt,
+            prompt,
             status: "queued",
           },
         });
@@ -1644,6 +1709,68 @@ export function createRouter(deps: RouterDeps) {
         });
         await deps.jobs.enqueue(runContinueJob(run.id));
         return { runId: run.id };
+      }),
+    },
+    scratchpad: {
+      list: authed.scratchpad.list.handler(async ({ context, input }) => {
+        await repos.getBot(context.actor, input.botId);
+        return listScratchpadItems(
+          { prisma: deps.prisma },
+          {
+            workspaceId: context.actor.workspaceId,
+            botId: input.botId,
+            status: input.status,
+            includeDone: input.includeDone ?? false,
+          },
+        );
+      }),
+      create: authed.scratchpad.create.handler(async ({ context, input }) => {
+        await repos.getBot(context.actor, input.botId);
+        const row = await deps.prisma.scratchpadItem.create({
+          data: {
+            workspaceId: context.actor.workspaceId,
+            botId: input.botId,
+            userId: context.actor.userId,
+            title: input.title.trim(),
+            status: input.status,
+            notes: input.notes.trim(),
+          },
+        });
+        return mapScratchpadItem(row);
+      }),
+      update: authed.scratchpad.update.handler(async ({ context, input }) => {
+        const existing = await deps.prisma.scratchpadItem.findFirst({
+          where: {
+            id: input.itemId,
+            workspaceId: context.actor.workspaceId,
+            userId: context.actor.userId,
+          },
+        });
+        if (!existing) throw new IsolationError();
+        if (input.status !== undefined && !isScratchpadStatus(input.status)) {
+          throw new ORPCError("BAD_REQUEST", { message: "Invalid scratchpad status." });
+        }
+        const row = await deps.prisma.scratchpadItem.update({
+          where: { id: existing.id },
+          data: {
+            ...(input.title !== undefined ? { title: input.title.trim() } : {}),
+            ...(input.status !== undefined ? { status: input.status } : {}),
+            ...(input.notes !== undefined ? { notes: input.notes.trim() } : {}),
+          },
+        });
+        return mapScratchpadItem(row);
+      }),
+      remove: authed.scratchpad.remove.handler(async ({ context, input }) => {
+        const existing = await deps.prisma.scratchpadItem.findFirst({
+          where: {
+            id: input.itemId,
+            workspaceId: context.actor.workspaceId,
+            userId: context.actor.userId,
+          },
+        });
+        if (!existing) throw new IsolationError();
+        await deps.prisma.scratchpadItem.delete({ where: { id: existing.id } });
+        return { ok: true as const };
       }),
     },
     skills: {
@@ -1681,6 +1808,21 @@ export function createRouter(deps: RouterDeps) {
       ),
       remove: authed.skills.remove.handler(async ({ context, input }) =>
         taughtSkills.remove(context.actor, input.skillId),
+      ),
+    },
+    agentSkills: {
+      list: authed.agentSkills.list.handler(async ({ context }) => agentSkills.list(context.actor)),
+      get: authed.agentSkills.get.handler(async ({ context, input }) =>
+        agentSkills.get(context.actor, input),
+      ),
+      create: authed.agentSkills.create.handler(async ({ context, input }) =>
+        agentSkills.create(context.actor, input),
+      ),
+      update: authed.agentSkills.update.handler(async ({ context, input }) =>
+        agentSkills.update(context.actor, input),
+      ),
+      remove: authed.agentSkills.remove.handler(async ({ context, input }) =>
+        agentSkills.remove(context.actor, input.skillId),
       ),
     },
     capabilities: {
@@ -2710,7 +2852,12 @@ async function computerStatus(
   if (await expireStaleComputerControl(deps, bot.computer)) {
     bot = await repos.getBot(actor, botId);
   }
-  return toComputerStatus(botId, bot.computer);
+  const busyBotName = await resolveBusyBotName(deps.prisma, {
+    computerId: bot.computer?.id,
+    botId,
+    botName: bot.name,
+  });
+  return toComputerStatus(botId, bot.computer, busyBotName);
 }
 
 async function expireStaleComputerControl(

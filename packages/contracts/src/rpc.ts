@@ -3,6 +3,8 @@ import * as z from "zod";
 import { ATTACHMENT_MAX_BASE64_LENGTH, ATTACHMENT_MAX_COUNT } from "./attachments.js";
 import {
   ActionApprovalRuleSchema,
+  AgentSkillCatalogEntrySchema,
+  AgentSkillSchema,
   AppBootstrapSchema,
   ArtifactSchema,
   ArtifactWithContentSchema,
@@ -15,9 +17,11 @@ import {
   ComputerStatusSchema,
   ConnectionCatalogItemSchema,
   ConnectionSchema,
+  CreateAgentSkillInput,
   CreateBotInput,
   CreateGroupInput,
   CreateRoutineInput,
+  CreateScratchpadItemInput,
   DeploymentSettingsSchema,
   ExportManifestSchema,
   GROUP_MEMBER_MAX,
@@ -33,11 +37,14 @@ import {
   ModelCredentialSchema,
   ModelOAuthBeginSchema,
   RoutineSchema,
+  ScratchpadItemSchema,
+  ScratchpadItemStatusSchema,
   SkillPlaybookSchema,
   TaughtSkillSchema,
   TeachRecordingEventSchema,
   ThreadMessagePageSchema,
   ThreadSnapshotSchema,
+  UpdateAgentSkillInput,
   UpdateBotInput,
   UpdateGroupInput,
   UsageRecordSchema,
@@ -294,6 +301,29 @@ export const appContract = {
     remove: oc.input(z.object({ routineId: Id })).output(z.object({ ok: z.literal(true) })),
     testRun: oc.input(z.object({ routineId: Id })).output(z.object({ runId: Id })),
   },
+  scratchpad: {
+    list: oc
+      .input(
+        z.object({
+          botId: Id,
+          status: ScratchpadItemStatusSchema.optional(),
+          includeDone: z.boolean().optional(),
+        }),
+      )
+      .output(z.array(ScratchpadItemSchema)),
+    create: oc.input(CreateScratchpadItemInput).output(ScratchpadItemSchema),
+    update: oc
+      .input(
+        z.object({
+          itemId: Id,
+          title: z.string().min(1).max(200).optional(),
+          status: ScratchpadItemStatusSchema.optional(),
+          notes: z.string().max(4_000).optional(),
+        }),
+      )
+      .output(ScratchpadItemSchema),
+    remove: oc.input(z.object({ itemId: Id })).output(z.object({ ok: z.literal(true) })),
+  },
   skills: {
     list: oc.input(botId).output(z.array(TaughtSkillSchema)),
     get: oc.input(z.object({ skillId: Id })).output(TaughtSkillSchema),
@@ -320,6 +350,28 @@ export const appContract = {
     testRun: oc
       .input(z.object({ skillId: Id, prompt: z.string().optional() }))
       .output(z.object({ runId: Id })),
+    remove: oc.input(z.object({ skillId: Id })).output(z.object({ ok: z.literal(true) })),
+  },
+  /** Claude Agent Skills (SKILL.md recipes) shared across assistants (not taught/demo skills). Pi already understands this format; we persist and inject them. */
+  agentSkills: {
+    list: oc.output(z.array(AgentSkillCatalogEntrySchema)),
+    get: oc
+      .input(
+        z
+          .object({ skillId: Id.optional(), name: z.string().min(1).max(80).optional() })
+          .superRefine((input, ctx) => {
+            if (!input.skillId && !input.name?.trim()) {
+              ctx.addIssue({
+                code: "custom",
+                message: "Provide skillId or name",
+                path: ["skillId"],
+              });
+            }
+          }),
+      )
+      .output(AgentSkillSchema),
+    create: oc.input(CreateAgentSkillInput).output(AgentSkillSchema),
+    update: oc.input(UpdateAgentSkillInput).output(AgentSkillSchema),
     remove: oc.input(z.object({ skillId: Id })).output(z.object({ ok: z.literal(true) })),
   },
   capabilities: {
