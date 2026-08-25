@@ -151,6 +151,13 @@ services:
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in Easypanel}
     expose:
       - "5173"
+    networks:
+      default:
+        aliases:
+          # Easypanel's Traefik dials {project}_{service}_{composeService}, but
+          # Compose names containers {project}-{service}-{index}. Without this
+          # alias the proxy target does not resolve and every request 502s.
+          - ${WEB_NETWORK_ALIAS:-claude_rakazo_web}
     depends_on:
       api:
         condition: service_healthy
