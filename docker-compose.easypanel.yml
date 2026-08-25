@@ -1,8 +1,8 @@
 # Rakazo on Easypanel.
 #
-# Uses the published image ghcr.io/elie222/rakazo/app, so nothing is built on
-# the server. Pin RAKAZO_IMAGE_TAG to a sha-<commit> tag for reproducible
-# deploys; `edge` tracks upstream main.
+# Builds from this checkout rather than pulling ghcr.io/elie222/rakazo/app,
+# because this branch carries local fixes that are not in the published image.
+# All three services share one image tag so Compose builds it once.
 #
 # Differences from docker-compose.prod.yml:
 #   - no caddy service and no published ports; Easypanel's Traefik owns 80/443
@@ -37,7 +37,10 @@ services:
       retries: 20
 
   api:
-    image: ${RAKAZO_IMAGE:-ghcr.io/elie222/rakazo/app}:${RAKAZO_IMAGE_TAG:-edge}
+    image: rakazo-local/app:current
+    build:
+      context: .
+      dockerfile: infra/compose/Dockerfile
     restart: unless-stopped
     command:
       - bash
@@ -92,7 +95,10 @@ services:
       retries: 30
 
   worker:
-    image: ${RAKAZO_IMAGE:-ghcr.io/elie222/rakazo/app}:${RAKAZO_IMAGE_TAG:-edge}
+    image: rakazo-local/app:current
+    build:
+      context: .
+      dockerfile: infra/compose/Dockerfile
     restart: unless-stopped
     command: ["pnpm", "--filter", "@rakazo/worker", "start"]
     init: true
@@ -132,7 +138,10 @@ services:
         condition: service_healthy
 
   web:
-    image: ${RAKAZO_IMAGE:-ghcr.io/elie222/rakazo/app}:${RAKAZO_IMAGE_TAG:-edge}
+    image: rakazo-local/app:current
+    build:
+      context: .
+      dockerfile: infra/compose/Dockerfile
     restart: unless-stopped
     command: ["pnpm", "--filter", "@rakazo/web", "preview", "--host", "0.0.0.0", "--port", "5173"]
     init: true
