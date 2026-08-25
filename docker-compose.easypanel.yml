@@ -1,0 +1,162 @@
+# Rakazo on Easypanel.
+#
+# Differences from docker-compose.prod.yml:
+#   - no caddy service and no published ports; Easypanel's Traefik owns 80/443
+#     and terminates TLS. Route one Easypanel domain to service `web`, port 5173.
+#   - no env_file; every value comes from Easypanel's Environment tab so secrets
+#     stay in the panel and never land in the repository.
+#
+# Required Easypanel environment variables:
+#   RAKAZO_HOST, POSTGRES_PASSWORD, BETTER_AUTH_SECRET, ENCRYPTION_KEY,
+#   E2B_API_KEY, OPENROUTER_API_KEY, SIGNUP_ALLOWLIST
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 200
+    mem_limit: 1g
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rakazo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Easypanel}
+      POSTGRES_DB: ${POSTGRES_DB:-rakazo}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rakazo} -d ${POSTGRES_DB:-rakazo}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/compose/Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-}
+    restart: unless-stopped
+    command:
+      - bash
+      - -lc
+      - pnpm --filter @rakazo/db exec prisma migrate deploy && pnpm --filter @rakazo/api start
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 1536m
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-rakazo}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Easypanel}@postgres:5432/${POSTGRES_DB:-rakazo}
+      DATA_DIR: /data
+      SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-e2b}
+      E2B_API_KEY: ${E2B_API_KEY:-}
+      AGENT_RUNTIME: pi
+      WAKEUP_DRIVER: graphile
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in Easypanel}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in Easypanel}
+      BETTER_AUTH_URL: https://${RAKAZO_HOST:?Set RAKAZO_HOST in Easypanel}
+      API_URL: https://${RAKAZO_HOST}
+      WEB_ORIGIN: https://${RAKAZO_HOST}
+      SIGNUPS_ENABLED: ${SIGNUPS_ENABLED:-true}
+      SIGNUP_ALLOWLIST: ${SIGNUP_ALLOWLIST:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      PI_DEFAULT_PROVIDER: ${PI_DEFAULT_PROVIDER:-openrouter}
+      PI_DEFAULT_MODEL: ${PI_DEFAULT_MODEL:-deepseek/deepseek-v4-flash-0731}
+      SANDBOX_IDLE_MS: ${SANDBOX_IDLE_MS:-600000}
+      SANDBOX_COMMAND_TIMEOUT_MS: ${SANDBOX_COMMAND_TIMEOUT_MS:-300000}
+      COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
+      SMTP_URL: ${SMTP_URL:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      GIT_SHA: ${GIT_SHA:-}
+    expose:
+      - "3100"
+    volumes:
+      - appdata:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3100/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/compose/Dockerfile
+    restart: unless-stopped
+    command: ["pnpm", "--filter", "@rakazo/worker", "start"]
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 1536m
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-rakazo}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Easypanel}@postgres:5432/${POSTGRES_DB:-rakazo}
+      DATA_DIR: /data
+      SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-e2b}
+      E2B_API_KEY: ${E2B_API_KEY:-}
+      AGENT_RUNTIME: pi
+      WAKEUP_DRIVER: graphile
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in Easypanel}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in Easypanel}
+      BETTER_AUTH_URL: https://${RAKAZO_HOST:?Set RAKAZO_HOST in Easypanel}
+      API_URL: https://${RAKAZO_HOST}
+      WEB_ORIGIN: https://${RAKAZO_HOST}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      PI_DEFAULT_PROVIDER: ${PI_DEFAULT_PROVIDER:-openrouter}
+      PI_DEFAULT_MODEL: ${PI_DEFAULT_MODEL:-deepseek/deepseek-v4-flash-0731}
+      SANDBOX_IDLE_MS: ${SANDBOX_IDLE_MS:-600000}
+      SANDBOX_COMMAND_TIMEOUT_MS: ${SANDBOX_COMMAND_TIMEOUT_MS:-300000}
+      COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
+      SMTP_URL: ${SMTP_URL:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - appdata:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: infra/compose/Dockerfile
+    restart: unless-stopped
+    command: ["pnpm", "--filter", "@rakazo/web", "preview", "--host", "0.0.0.0", "--port", "5173"]
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
+    environment:
+      NODE_ENV: production
+      API_PROXY_TARGET: http://api:3100
+      # Vite preview refuses any request whose Host header is not listed here.
+      RAKAZO_HOST: ${RAKAZO_HOST:?Set RAKAZO_HOST in Easypanel}
+      # Signs the short-lived /novnc/* screen capabilities; must match the API.
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET in Easypanel}
+    expose:
+      - "5173"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  appdata:
