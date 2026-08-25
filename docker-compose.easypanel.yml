@@ -73,7 +73,6 @@ services:
       COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
       SMTP_URL: ${SMTP_URL:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      GIT_SHA: ${GIT_SHA:-}
     expose:
       - "3100"
     volumes:
