@@ -83,15 +83,50 @@ export async function openDesktopBrowser(desktop: {
   launch: (application: string, uri?: string) => Promise<void>;
   open: (fileOrUrl: string) => Promise<void>;
 }): Promise<void> {
+  await openDesktopUrl(desktop, "https://www.google.com");
+}
+
+/**
+ * Open a URL in an installed browser.
+ *
+ * The desktop image ships google-chrome but leaves the default-browser
+ * association pointing at debian-sensible-browser, which resolves to nothing.
+ * Handing a URL to `open` therefore fails with "Failed to execute default Web
+ * Browser. Input/output error." Launch a known browser by name instead, and
+ * only fall back to the association when none of them is installed.
+ */
+export async function openDesktopUrl(
+  desktop: {
+    launch: (application: string, uri?: string) => Promise<void>;
+    open: (fileOrUrl: string) => Promise<void>;
+  },
+  url: string,
+): Promise<void> {
   for (const app of E2B_BROWSER_APPS) {
     try {
-      await desktop.launch(app);
+      await desktop.launch(app, url);
       return;
     } catch {
       // try the next installed browser
     }
   }
-  await desktop.open("https://www.google.com").catch(() => undefined);
+  await desktop.open(url).catch(() => undefined);
+}
+
+/**
+ * Point the desktop's default browser at an installed one.
+ *
+ * Both mechanisms matter: xdg-settings backs xdg-open, while XFCE's exo-open
+ * reads ~/.config/xfce4/helpers.rc. Neither lives under the checkpointed
+ * workspace, so this has to run for every machine rather than once.
+ */
+export function defaultBrowserCommand(): string {
+  return [
+    "command -v google-chrome >/dev/null 2>&1 || exit 0",
+    'mkdir -p "$HOME/.config/xfce4"',
+    "printf 'WebBrowser=google-chrome\\n' > \"$HOME/.config/xfce4/helpers.rc\"",
+    "xdg-settings set default-web-browser google-chrome.desktop >/dev/null 2>&1 || true",
+  ].join(" && ");
 }
 
 export class E2BSandboxProvider implements SandboxProvider {
@@ -220,6 +255,7 @@ export class E2BSandboxProvider implements SandboxProvider {
   async prepare(computer: ComputerRef, _context: AdapterContext): Promise<void> {
     const desktop = await this.box(computer);
     if (computer.fresh) await desktop.files.makeDir(E2B_WORKSPACE);
+    await desktop.commands.run(defaultBrowserCommand()).catch(() => undefined);
     const profilesChanged = await configurePortableBrowserProfiles(desktop);
     if (!computer.fresh && profilesChanged) await openDesktopBrowser(desktop);
   }
@@ -630,9 +666,19 @@ export class E2BSandboxProvider implements SandboxProvider {
       const tokenFile = "/tmp/rakazo-control.token";
       const command = [
         controlStreamStopCommand(),
+        // Wait for the previous x11vnc to release the port. Without this a
+        // survivor keeps serving the old password while the new x11vnc fails
+        // to bind, and every later connection is rejected with
+        // "password check failed".
+        `for i in $(seq 1 50); do netstat -tuln | grep -q ':${layout.controlVncPort} ' || break; sleep 0.1; done`,
+        `if netstat -tuln | grep -q ':${layout.controlVncPort} '; then exit 1; fi`,
         `printf %s ${shellQuote(controlToken)} > ${tokenFile}`,
         `x11vnc -storepasswd ${shellQuote(password)} ${passwordFile} >/dev/null`,
         `x11vnc -bg -display ${shellQuote(desktop.display)} -forever -wait 50 -shared -rfbport ${layout.controlVncPort} -rfbauth ${passwordFile} 2>/tmp/rakazo-control-x11vnc.log`,
+        // Confirm the VNC server is up before starting the proxy in front of
+        // it; the proxy port alone says nothing about which x11vnc answers.
+        `for i in $(seq 1 50); do netstat -tuln | grep -q ':${layout.controlVncPort} ' && break; sleep 0.1; done`,
+        `netstat -tuln | grep -q ':${layout.controlVncPort} ' || exit 1`,
         "cd /opt/noVNC/utils",
         `(nohup ./novnc_proxy --vnc localhost:${layout.controlVncPort} --listen ${layout.controlPort} --web /opt/noVNC >/tmp/rakazo-control-novnc.log 2>&1 &)`,
         `for i in $(seq 1 50); do netstat -tuln | grep -q ':${layout.controlPort} ' && exit 0; sleep 0.1; done`,
@@ -799,10 +845,11 @@ async function applyE2BAction(desktop: Sandbox, action: ComputerAction): Promise
     return;
   }
   if (action.kind === "open") {
-    const value = /^https?:\/\//i.test(action.path)
-      ? action.path
-      : workspacePath(E2B_WORKSPACE, action.path);
-    await desktop.open(value);
+    if (/^https?:\/\//i.test(action.path)) {
+      await openDesktopUrl(desktop, action.path);
+      return;
+    }
+    await desktop.open(workspacePath(E2B_WORKSPACE, action.path));
     return;
   }
   await desktop.launch(action.application, action.uri);
