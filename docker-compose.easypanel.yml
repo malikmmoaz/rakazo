@@ -173,9 +173,12 @@ volumes:
 
 networks:
   default: {}
-  # Easypanel's proxy network. Set EASYPANEL_NETWORK in the panel if this
-  # server names it something else; `docker network ls` on the host is
-  # authoritative.
+  # Easypanel's proxy network: the one Traefik is attached to, which is the
+  # shared `easypanel` overlay rather than the per-project `easypanel-<project>`
+  # one. Confirm with:
+  #   docker inspect $(docker ps -qf name=traefik) \
+  #     --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
+  # Override with EASYPANEL_NETWORK if a server names it differently.
   proxy:
     external: true
-    name: ${EASYPANEL_NETWORK:-easypanel-overlay}
+    name: ${EASYPANEL_NETWORK:-easypanel}
