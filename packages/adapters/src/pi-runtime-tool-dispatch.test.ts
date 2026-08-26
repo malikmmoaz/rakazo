@@ -187,11 +187,14 @@ describe("Pi connector tool dispatch", () => {
       events.push(event);
     }
 
+    // The budget still stops real work at 80 calls, so executeTool is never
+    // reached again. The extra calls are answered with the summarize
+    // instruction instead of the loop being aborted underneath the model.
     expect(executeTool).toHaveBeenCalledTimes(79);
     expect(fakeAgentState.abortCount).toBeGreaterThanOrEqual(2);
     expect(events).toContainEqual({
       type: "progress",
-      text: "Stopped: more than 80 tool calls in one turn.",
+      text: "Tool budget reached (80 calls); asking for a summary.",
     });
   });
 });

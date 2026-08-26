@@ -55,7 +55,27 @@ const AGENT_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const MAX_AGENT_TOOL_NAME_LENGTH = 64;
 const FALLBACK_AGENT_TOOL_NAME = "connector_tool";
 // Bound runaway agent loops before they can issue unbounded billable tool calls.
-const MAX_TOOL_CALLS_PER_TURN = 80;
+const DEFAULT_MAX_TOOL_CALLS_PER_TURN = 80;
+/**
+ * Desktop work spends the budget far faster than text work: a single UI
+ * interaction usually costs an observe, an act, and a re-observe, so 80 calls
+ * is only ~30 real actions. Computer-enabled bots get a higher default.
+ */
+const DEFAULT_MAX_TOOL_CALLS_PER_TURN_COMPUTER = 400;
+/** Tool calls answered with the summarize instruction before the turn is cut. */
+const MAX_TOOL_CALL_DENIALS = 3;
+
+/** Resolve the per-turn tool budget; MAX_TOOL_CALLS_PER_TURN overrides both defaults. */
+export function maxToolCallsPerTurn(hasComputer: boolean): number {
+  const raw = Number(process.env.MAX_TOOL_CALLS_PER_TURN ?? "");
+  if (Number.isFinite(raw) && raw >= 1) return Math.floor(raw);
+  return hasComputer ? DEFAULT_MAX_TOOL_CALLS_PER_TURN_COMPUTER : DEFAULT_MAX_TOOL_CALLS_PER_TURN;
+}
+
+const TOOL_BUDGET_EXHAUSTED_MESSAGE =
+  "The tool budget for this turn is exhausted, so no further tool calls will run. " +
+  "Reply now with a short summary of what you completed, what is still outstanding, " +
+  "and the next step you would take. Do not call any more tools.";
 
 export class PiAgentRuntime implements AgentRuntime {
   describe() {
@@ -121,7 +141,12 @@ export class PiAgentRuntime implements AgentRuntime {
           apiKey,
           nestedAgents,
           subagentGate: createGate(MAX_PARALLEL_SUBAGENTS),
-          toolCallBudget: { count: 0, exceeded: false },
+          toolCallBudget: {
+            count: 0,
+            exceeded: false,
+            limit: maxToolCallsPerTurn(toolDefs.some((tool) => tool.name === "computer_observe")),
+            denials: 0,
+          },
           abortTurn: () => undefined,
           signal,
           depth: 0,
@@ -485,6 +510,16 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
     execute: async (toolCallId, params) => {
       const args = (params ?? {}) as Record<string, unknown>;
       const executionId = toolCallId || `${host.request.runId}:${tool.name}`;
+      if (host.toolCallBudget.exceeded) {
+        // Answer rather than execute, so the model can write a closing summary.
+        // A model that keeps calling tools anyway still gets cut off.
+        host.toolCallBudget.denials += 1;
+        if (host.toolCallBudget.denials > MAX_TOOL_CALL_DENIALS) host.abortTurn();
+        return {
+          content: [{ type: "text", text: TOOL_BUDGET_EXHAUSTED_MESSAGE }],
+          details: { budgetExhausted: true, limit: host.toolCallBudget.limit },
+        };
+      }
       host.queue.push({ type: "tool", name: tool.name, args, executionId });
       if (tool.name === "request_takeover") {
         host.queue.push({
@@ -849,7 +884,7 @@ interface ToolHost {
   apiKey: string | undefined;
   nestedAgents: Set<Agent>;
   subagentGate: { acquire(): Promise<void>; release(): void };
-  toolCallBudget: { count: number; exceeded: boolean };
+  toolCallBudget: { count: number; exceeded: boolean; limit: number; denials: number };
   abortTurn(): void;
   signal: AbortSignal;
   depth: number;
@@ -857,15 +892,16 @@ interface ToolHost {
 
 function consumeToolCall(host: ToolHost): boolean {
   host.toolCallBudget.count += 1;
-  if (host.toolCallBudget.count <= MAX_TOOL_CALLS_PER_TURN) return true;
+  if (host.toolCallBudget.count <= host.toolCallBudget.limit) return true;
   if (!host.toolCallBudget.exceeded) {
     host.toolCallBudget.exceeded = true;
     host.queue.push({
       type: "progress",
-      text: `Stopped: more than ${MAX_TOOL_CALLS_PER_TURN} tool calls in one turn.`,
+      text: `Tool budget reached (${host.toolCallBudget.limit} calls); asking for a summary.`,
     });
   }
-  host.abortTurn();
+  // Deliberately no abortTurn(): execute() answers the call with the summarize
+  // instruction so the model can close out, instead of the loop dying under it.
   return false;
 }
 
