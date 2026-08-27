@@ -25,6 +25,7 @@ import {
   registerOpenAiCompatibleCatalog,
   registerOpenAiCompatibleRuntime,
 } from "./pi-openai-compatible-provider.js";
+import { textContentArg } from "./tool-text.js";
 
 const running = new Map<string, AbortController>();
 // Built on first use, not at module load: entry points call loadRootEnv() after
@@ -54,28 +55,15 @@ function thinkingLevelFor(
 const AGENT_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const MAX_AGENT_TOOL_NAME_LENGTH = 64;
 const FALLBACK_AGENT_TOOL_NAME = "connector_tool";
-// Bound runaway agent loops before they can issue unbounded billable tool calls.
-const DEFAULT_MAX_TOOL_CALLS_PER_TURN = 80;
-/**
- * Desktop work spends the budget far faster than text work: a single UI
- * interaction usually costs an observe, an act, and a re-observe, so 80 calls
- * is only ~30 real actions. Computer-enabled bots get a higher default.
- */
-const DEFAULT_MAX_TOOL_CALLS_PER_TURN_COMPUTER = 400;
-/** Tool calls answered with the summarize instruction before the turn is cut. */
-const MAX_TOOL_CALL_DENIALS = 3;
 
-/** Resolve the per-turn tool budget; MAX_TOOL_CALLS_PER_TURN overrides both defaults. */
-export function maxToolCallsPerTurn(hasComputer: boolean): number {
-  const raw = Number(process.env.MAX_TOOL_CALLS_PER_TURN ?? "");
-  if (Number.isFinite(raw) && raw >= 1) return Math.floor(raw);
-  return hasComputer ? DEFAULT_MAX_TOOL_CALLS_PER_TURN_COMPUTER : DEFAULT_MAX_TOOL_CALLS_PER_TURN;
+/** Optional self-host fuse. Unset, empty, or 0 means unlimited (default). */
+export function maxToolCallsPerTurn(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.MAX_TOOL_CALLS_PER_TURN?.trim();
+  if (!raw) return 0;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.floor(parsed);
 }
-
-const TOOL_BUDGET_EXHAUSTED_MESSAGE =
-  "The tool budget for this turn is exhausted, so no further tool calls will run. " +
-  "Reply now with a short summary of what you completed, what is still outstanding, " +
-  "and the next step you would take. Do not call any more tools.";
 
 export class PiAgentRuntime implements AgentRuntime {
   describe() {
@@ -141,12 +129,7 @@ export class PiAgentRuntime implements AgentRuntime {
           apiKey,
           nestedAgents,
           subagentGate: createGate(MAX_PARALLEL_SUBAGENTS),
-          toolCallBudget: {
-            count: 0,
-            exceeded: false,
-            limit: maxToolCallsPerTurn(toolDefs.some((tool) => tool.name === "computer_observe")),
-            denials: 0,
-          },
+          toolCallBudget: { count: 0, exceeded: false, limit: maxToolCallsPerTurn() },
           abortTurn: () => undefined,
           signal,
           depth: 0,
@@ -243,11 +226,25 @@ export class PiAgentRuntime implements AgentRuntime {
           signal.removeEventListener("abort", onAbort);
         }
 
+        // Budget abort stops the agent underneath the model, which leaves
+        // errorMessage set. Treat that as a soft stop so the turn still ends
+        // with a durable assistant message instead of a failed run.
+        const budgetExceeded = host.toolCallBudget.exceeded;
         const error = agent.state.errorMessage;
-        if (error) {
+        if (error && !budgetExceeded) {
           throw new Error(sanitizeError(error));
         }
-        if (!streamed) {
+        if (budgetExceeded) {
+          const budgetMessage = toolCallBudgetExceededMessage(host.toolCallBudget.limit);
+          if (streamed.trim()) {
+            const suffix = `\n\n${budgetMessage}`;
+            queue.push({ type: "text", text: suffix });
+            streamed += suffix;
+          } else {
+            queue.push({ type: "text", text: budgetMessage });
+            streamed = budgetMessage;
+          }
+        } else if (!streamed) {
           const fallback = assistantText(agent.state.messages.at(-1)) || "I finished the work.";
           queue.push({ type: "text", text: fallback });
           streamed = fallback;
@@ -459,7 +456,10 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
         return { reason: String(raw.reason ?? "I need you on the screen.") };
       }
       if (tool.name === "write_file") {
-        return { path: String(raw.path ?? "notes/result.txt"), content: String(raw.content ?? "") };
+        return {
+          path: String(raw.path ?? "notes/result.txt"),
+          content: textContentArg(raw.content, ""),
+        };
       }
       if (tool.name === "computer_act") {
         return {
@@ -510,16 +510,6 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
     execute: async (toolCallId, params) => {
       const args = (params ?? {}) as Record<string, unknown>;
       const executionId = toolCallId || `${host.request.runId}:${tool.name}`;
-      if (host.toolCallBudget.exceeded) {
-        // Answer rather than execute, so the model can write a closing summary.
-        // A model that keeps calling tools anyway still gets cut off.
-        host.toolCallBudget.denials += 1;
-        if (host.toolCallBudget.denials > MAX_TOOL_CALL_DENIALS) host.abortTurn();
-        return {
-          content: [{ type: "text", text: TOOL_BUDGET_EXHAUSTED_MESSAGE }],
-          details: { budgetExhausted: true, limit: host.toolCallBudget.limit },
-        };
-      }
       host.queue.push({ type: "tool", name: tool.name, args, executionId });
       if (tool.name === "request_takeover") {
         host.queue.push({
@@ -667,13 +657,22 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
     await nested.prompt(task || "Complete the delegated task.");
     await nested.waitForIdle();
     host.signal.removeEventListener("abort", onAbort);
+    // Shared-budget abort leaves errorMessage on the nested agent; surface it as a
+    // completed stop rather than a failed subagent chip.
+    const budgetExceeded = host.toolCallBudget.exceeded;
     const error = nested.state.errorMessage;
-    if (error) {
+    if (error && !budgetExceeded) {
       const message = sanitizeError(error);
       host.queue.push({ type: "subagent", agentId, name, task, status: "failed", result: message });
       return `Subagent failed: ${message}`;
     }
-    const result = streamed || assistantText(nested.state.messages.at(-1)) || "done.";
+    const budgetMessage = budgetExceeded
+      ? toolCallBudgetExceededMessage(host.toolCallBudget.limit)
+      : undefined;
+    const result =
+      budgetMessage && streamed.trim()
+        ? `${streamed.trim()}\n\n${budgetMessage}`
+        : budgetMessage || streamed || assistantText(nested.state.messages.at(-1)) || "done.";
     const clipped = result.length > 12_000 ? `${result.slice(0, 12_000)}…` : result;
     host.queue.push({
       type: "subagent",
@@ -884,24 +883,29 @@ interface ToolHost {
   apiKey: string | undefined;
   nestedAgents: Set<Agent>;
   subagentGate: { acquire(): Promise<void>; release(): void };
-  toolCallBudget: { count: number; exceeded: boolean; limit: number; denials: number };
+  toolCallBudget: { count: number; exceeded: boolean; limit: number };
   abortTurn(): void;
   signal: AbortSignal;
   depth: number;
 }
 
+function toolCallBudgetExceededMessage(limit: number) {
+  return `I stopped after reaching the limit of ${limit} tool calls in this turn. Send another message to continue.`;
+}
+
 function consumeToolCall(host: ToolHost): boolean {
   host.toolCallBudget.count += 1;
-  if (host.toolCallBudget.count <= host.toolCallBudget.limit) return true;
+  const limit = host.toolCallBudget.limit;
+  // limit <= 0 means unlimited — do not abort.
+  if (limit <= 0 || host.toolCallBudget.count <= limit) return true;
   if (!host.toolCallBudget.exceeded) {
     host.toolCallBudget.exceeded = true;
     host.queue.push({
       type: "progress",
-      text: `Tool budget reached (${host.toolCallBudget.limit} calls); asking for a summary.`,
+      text: `Stopped: more than ${limit} tool calls in one turn.`,
     });
   }
-  // Deliberately no abortTurn(): execute() answers the call with the summarize
-  // instruction so the model can close out, instead of the loop dying under it.
+  host.abortTurn();
   return false;
 }
 

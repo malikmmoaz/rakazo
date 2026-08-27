@@ -41,10 +41,7 @@ services:
       retries: 20
 
   api:
-    image: rakazo-local/app:current
-    build:
-      context: .
-      dockerfile: infra/compose/Dockerfile
+    image: ${RAKAZO_IMAGE:-ghcr.io/elie222/rakazo/app}:${RAKAZO_IMAGE_TAG:-sha-5d645da5f5a7345222c31868d75435a7d8616c3d}
     restart: unless-stopped
     command:
       - bash
@@ -98,10 +95,7 @@ services:
       retries: 30
 
   worker:
-    image: rakazo-local/app:current
-    build:
-      context: .
-      dockerfile: infra/compose/Dockerfile
+    image: ${RAKAZO_IMAGE:-ghcr.io/elie222/rakazo/app}:${RAKAZO_IMAGE_TAG:-sha-5d645da5f5a7345222c31868d75435a7d8616c3d}
     restart: unless-stopped
     command: ["pnpm", "--filter", "@rakazo/worker", "start"]
     init: true
@@ -141,10 +135,7 @@ services:
         condition: service_healthy
 
   web:
-    image: rakazo-local/app:current
-    build:
-      context: .
-      dockerfile: infra/compose/Dockerfile
+    image: ${RAKAZO_IMAGE:-ghcr.io/elie222/rakazo/app}:${RAKAZO_IMAGE_TAG:-sha-5d645da5f5a7345222c31868d75435a7d8616c3d}
     restart: unless-stopped
     command: ["pnpm", "--filter", "@rakazo/web", "preview", "--host", "0.0.0.0", "--port", "5173"]
     init: true

@@ -1,18 +1,28 @@
 import { ChatMarkdown } from "@rakazo/chat-ui/native";
-import type { AgentSkillCatalogEntry, MessageBlock } from "@rakazo/contracts";
+import type {
+  AgentSkillCatalogEntry,
+  Connection,
+  ConnectionCatalogItem,
+  MessageBlock,
+  Routine,
+} from "@rakazo/contracts";
 import {
   abortableDelay,
   attachmentsForThread,
+  buildComposerMentionOptions,
+  type ComposerMention,
   isApprovalAskBlock,
   isRunTerminalEvent,
   latestAnswerableAskMessageId,
+  mentionChipKey,
+  resolveComposerSendPlan,
   SLASH_ACTIONS,
   type SlashActionId,
   serializeComposerPrompt,
   truncateSlashDescription,
 } from "@rakazo/core";
 import { Link, useFocusEffect, useLocalSearchParams, useNavigation, useRouter } from "expo-router";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Alert, AppState, Image, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { AskActions } from "../components/AskActions";
 import {
@@ -23,6 +33,8 @@ import { NativeSymbol } from "../components/native-symbol";
 import {
   applyMobileThreadEvent,
   blockText,
+  type MobileBot,
+  type MobileGroup,
   type MobileMessage,
   type MobileMessagePage,
   type MobileSnapshot,
@@ -43,6 +55,14 @@ import {
 import { playMpeg, speakUtterance } from "../lib/voice";
 
 type PendingAttachment = PickedAttachment & { threadKey: string };
+
+function newClientNonce(): string {
+  const webCrypto = globalThis.crypto;
+  if (webCrypto && typeof webCrypto.randomUUID === "function") {
+    return webCrypto.randomUUID();
+  }
+  return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 function formatApprovalAnswer(answer: string | undefined): string {
   if (!answer) return "Answered";
@@ -67,7 +87,8 @@ export default function Thread() {
   const expandedHistoryThread = useRef<string | null>(null);
   const historyEpoch = useRef(0);
   const pinnedAroundRef = useRef<{
-    botId: string;
+    botId?: string;
+    groupId?: string;
     messageId: string;
     threadId: string;
     messages: readonly MobileMessage[];
@@ -90,9 +111,18 @@ export default function Thread() {
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [agentSkills, setAgentSkills] = useState<AgentSkillCatalogEntry[]>([]);
-  const [selectedMentions, setSelectedMentions] = useState<
-    Array<{ botId: string; name: string; color?: string }>
+  const [mentionBots, setMentionBots] = useState<MobileBot[]>([]);
+  const [mentionGroups, setMentionGroups] = useState<MobileGroup[]>([]);
+  const [mentionRoutines, setMentionRoutines] = useState<Array<Routine & { botName?: string }>>([]);
+  const [mentionConnectors, setMentionConnectors] = useState<
+    Array<{
+      id: string;
+      name: string;
+      authStatus: "connected" | "needs_auth";
+      connectionId?: string;
+    }>
   >([]);
+  const [selectedMentions, setSelectedMentions] = useState<ComposerMention[]>([]);
   const [selectedSkill, setSelectedSkill] = useState<AgentSkillCatalogEntry | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [replyTarget, setReplyTarget] = useState<MobileMessage | null>(null);
@@ -104,17 +134,32 @@ export default function Thread() {
     null,
   );
   const activePendingAttachments = attachmentsForThread(pendingAttachments, threadKey);
-  const mentionOptions =
-    inGroup && mentionQuery !== null
-      ? [
-          ...((snap?.members ?? []).filter((member) =>
-            member.name.toLowerCase().startsWith(mentionQuery.toLowerCase()),
-          ) ?? []),
-          ...("everyone".startsWith(mentionQuery.toLowerCase())
-            ? [{ botId: "everyone", name: "everyone", color: "#85858A" }]
-            : []),
-        ].slice(0, 8)
-      : [];
+  const composerMentionTargets = useMemo(
+    () =>
+      buildComposerMentionOptions({
+        query: "",
+        includeEveryone: inGroup,
+        currentGroupId: groupId,
+        bots: mentionBots.map((bot) => ({ id: bot.id, name: bot.name, color: bot.color })),
+        groups: mentionGroups.map((group) => ({ id: group.id, name: group.name })),
+        routines: mentionRoutines.map((routine) => ({
+          id: routine.id,
+          name: routine.name,
+          crons: routine.crons,
+          botId: routine.botId,
+          botName: routine.botName,
+        })),
+        connectors: mentionConnectors,
+      }),
+    [groupId, inGroup, mentionBots, mentionConnectors, mentionGroups, mentionRoutines],
+  );
+  const mentionOptions = useMemo(() => {
+    if (mentionQuery === null || composerMentionTargets.length === 0) return [];
+    const query = mentionQuery.trim().toLowerCase();
+    return composerMentionTargets
+      .filter((target) => !query || target.name.toLowerCase().startsWith(query))
+      .slice(0, 10);
+  }, [composerMentionTargets, mentionQuery]);
   const slashQueryNormalized = slashQuery?.trim().toLowerCase() ?? null;
   const slashSkillOptions =
     slashQuery !== null && mentionQuery === null
@@ -141,6 +186,80 @@ export default function Thread() {
       .then(setAgentSkills)
       .catch(() => setAgentSkills([]));
   }, []);
+
+  useEffect(() => {
+    void rpc<MobileBot[]>("bots/list")
+      .then(setMentionBots)
+      .catch(() => setMentionBots([]));
+    void rpc<MobileGroup[]>("groups/list")
+      .then(setMentionGroups)
+      .catch(() => setMentionGroups([]));
+  }, []);
+
+  useEffect(() => {
+    if (mentionBots.length === 0) {
+      setMentionRoutines([]);
+      setMentionConnectors([]);
+      return;
+    }
+    let cancelled = false;
+    const botNameById = new Map(mentionBots.map((bot) => [bot.id, bot.name]));
+    void Promise.all(
+      mentionBots.map((bot) =>
+        rpc<Routine[]>("routines/list", { botId: bot.id })
+          .then((rows) =>
+            rows.map((routine) => ({
+              ...routine,
+              botName: botNameById.get(bot.id) ?? bot.name,
+            })),
+          )
+          .catch(() => [] as Array<Routine & { botName?: string }>),
+      ),
+    ).then((lists) => {
+      if (!cancelled) setMentionRoutines(lists.flat());
+    });
+    void Promise.all([
+      rpc<Connection[]>("connections/list").catch(() => [] as Connection[]),
+      rpc<ConnectionCatalogItem[]>("connections/catalog", {}).catch(
+        () => [] as ConnectionCatalogItem[],
+      ),
+    ]).then(([connections, catalog]) => {
+      if (cancelled) return;
+      const connected = connections.filter((row) => row.status === "connected");
+      const options: Array<{
+        id: string;
+        name: string;
+        authStatus: "connected" | "needs_auth";
+        connectionId?: string;
+      }> = connected.map((row) => ({
+        id: row.id,
+        name: row.displayName,
+        authStatus: "connected" as const,
+        connectionId: row.id,
+      }));
+      for (const item of catalog) {
+        if (item.connected || item.noAuth) continue;
+        if (
+          connected.some(
+            (row) =>
+              row.provider.toLowerCase() === item.slug.toLowerCase() ||
+              row.displayName.toLowerCase() === item.name.toLowerCase(),
+          )
+        ) {
+          continue;
+        }
+        options.push({
+          id: `catalog:${item.connectorId}:${item.slug}`,
+          name: item.name,
+          authStatus: "needs_auth",
+        });
+      }
+      setMentionConnectors(options);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [mentionBots]);
 
   function isCurrentTarget(targetBotId: string | undefined, targetGroupId: string | undefined) {
     return activeBotId.current === targetBotId && activeGroupId.current === targetGroupId;
@@ -248,42 +367,36 @@ export default function Thread() {
       })
     )
       return next;
-    const pin = pinnedAroundRef.current;
-    setSnap((prev) => {
-      let merged = mergeMobileSnapshot(prev, next, expandedHistoryThread.current === next.threadId);
-      if (pin && merged && pin.botId === targetBotId) {
-        merged = {
-          ...merged,
-          messages: [...pin.messages],
-          olderCursor: pin.olderCursor,
-        };
-      }
-      return merged;
-    });
+    setSnap((prev) =>
+      mergeMobileSnapshot(prev, next, expandedHistoryThread.current === next.threadId),
+    );
     return next;
   }
 
-  async function applyMessageJump(targetBotId: string, targetMessageId: string) {
+  async function applyMessageJump(target: { botId?: string; groupId?: string; messageId: string }) {
+    const threadTarget = target.groupId ? { groupId: target.groupId } : { botId: target.botId! };
     const epoch = historyEpoch.current;
     const [snap, page] = await Promise.all([
-      rpc<MobileSnapshot>("threads/get", { botId: targetBotId }),
+      rpc<MobileSnapshot>("threads/get", threadTarget),
       rpc<MobileMessagePage>("threads/messages", {
-        botId: targetBotId,
-        around: { messageId: targetMessageId },
+        ...threadTarget,
+        around: { messageId: target.messageId },
       }),
     ]);
     // The epoch check drops a jump that raced a conversation clear (or a bot switch): applying
     // the fetched page would pin deleted messages that every later refresh keeps restoring.
     if (epoch !== historyEpoch.current) return;
+    if (target.groupId && activeGroupId.current !== target.groupId) return;
+    if (target.botId && activeBotId.current !== target.botId) return;
     expandedHistoryThread.current = page.threadId;
     pinnedAroundRef.current = {
-      botId: targetBotId,
-      messageId: targetMessageId,
+      ...threadTarget,
+      messageId: target.messageId,
       threadId: page.threadId,
       messages: [...page.messages],
       olderCursor: page.olderCursor,
     };
-    jumpScrollTarget.current = targetMessageId;
+    jumpScrollTarget.current = target.messageId;
     setSnap({
       ...snap,
       messages: [...page.messages],
@@ -357,10 +470,18 @@ export default function Thread() {
     historyEpoch.current += 1;
     const abort = new AbortController();
     void (async () => {
-      const next = await refresh().catch((err: Error) => {
-        setError(err.message);
-        return null;
-      });
+      // Pending search jumps load the around-page separately; avoid replacing it with latest.
+      const next = messageId
+        ? await rpc<MobileSnapshot>("threads/get", groupId ? { groupId } : { botId: botId! }).catch(
+            (err: Error) => {
+              setError(err.message);
+              return null;
+            },
+          )
+        : await refresh().catch((err: Error) => {
+            setError(err.message);
+            return null;
+          });
       if (abort.signal.aborted) return;
       let cursor = next?.cursor ?? -1;
       let retryMs = 250;
@@ -394,7 +515,9 @@ export default function Thread() {
                 markReadIfVisible();
               }
               if (isRunTerminalEvent(event)) {
-                void refresh().catch(() => undefined);
+                if (!jumpScrollTarget.current && !expandedHistoryThread.current) {
+                  void refresh().catch(() => undefined);
+                }
               }
             },
             abort.signal,
@@ -403,7 +526,9 @@ export default function Thread() {
           // A full refresh reconciles visible state; the event cursor still resumes without gaps.
         }
         if (abort.signal.aborted) break;
-        await refresh().catch(() => undefined);
+        if (!jumpScrollTarget.current && !expandedHistoryThread.current) {
+          await refresh().catch(() => undefined);
+        }
         await abortableDelay(retryMs, abort.signal);
         retryMs = Math.min(retryMs * 2, 5_000);
       }
@@ -414,11 +539,13 @@ export default function Thread() {
   }, [botId, groupId, markReadIfVisible]);
 
   useEffect(() => {
-    if (!botId || !messageId) return;
-    void applyMessageJump(botId, messageId).catch((err) => {
-      setError(err instanceof Error ? err.message : "Could not open message");
-    });
-  }, [botId, messageId]);
+    if ((!botId && !groupId) || !messageId) return;
+    void applyMessageJump(groupId ? { groupId, messageId } : { botId: botId!, messageId }).catch(
+      (err) => {
+        setError(err instanceof Error ? err.message : "Could not open message");
+      },
+    );
+  }, [botId, groupId, messageId]);
 
   useEffect(() => {
     setPendingAttachments((current) => attachmentsForThread(current, threadKey));
@@ -440,15 +567,13 @@ export default function Thread() {
     setSlashQuery(slashMatch ? (slashMatch[1] ?? "") : null);
   }
 
-  function insertMention(member: { botId: string; name: string; color?: string }) {
+  function insertMention(mention: ComposerMention) {
     setDraft((current) => current.replace(/@([\w-]*)$/, ""));
     setMentionQuery(null);
-    if (member.botId === "everyone") {
-      setDraft((current) => `${current.replace(/\s+$/, "")} @everyone `.replace(/^\s+/, ""));
-      return;
-    }
     setSelectedMentions((current) =>
-      current.some((selected) => selected.botId === member.botId) ? current : [...current, member],
+      current.some((selected) => mentionChipKey(selected) === mentionChipKey(mention))
+        ? current
+        : [...current, mention],
     );
   }
 
@@ -494,19 +619,70 @@ export default function Thread() {
     activePendingAttachments.length > 0;
 
   async function send() {
-    const targetBotId = botId;
-    const targetGroupId = groupId;
-    if ((!targetBotId && !targetGroupId) || sending) return;
-    const attachments = attachmentsForThread(pendingAttachments, threadKey);
-    const text = serializeComposerPromptText().trim();
-    if (!text && attachments.length === 0) return;
+    const initialBotTarget = botId;
+    const initialGroupTarget = groupId;
+    if ((!initialBotTarget && !initialGroupTarget) || sending) return;
+    const originThreadKey = initialGroupTarget ?? initialBotTarget;
+    const attachments = attachmentsForThread(pendingAttachments, originThreadKey);
+    const plan = resolveComposerSendPlan({
+      text: serializeComposerPromptText(),
+      mentions: selectedMentions,
+      hasAttachments: attachments.length > 0,
+    });
+    if (plan.isNoOp) return;
+    const reroutedToGroup = Boolean(
+      plan.rerouteGroupId && plan.rerouteGroupId !== initialGroupTarget,
+    );
+    const groupTarget = plan.rerouteGroupId ?? initialGroupTarget;
+    const botTarget = reroutedToGroup ? undefined : initialBotTarget;
+    const trimmed = plan.trimmed;
     setSending(true);
     setError(null);
     try {
+      if (plan.shouldRunRoutines) {
+        const sendNonce = newClientNonce();
+        await Promise.all(
+          plan.routineIds.map((routineId) =>
+            rpc("routines/testRun", {
+              routineId,
+              clientNonce: `routine-mention:${sendNonce}:${routineId}`,
+            }),
+          ),
+        );
+      }
+      const clearOriginComposer = () => {
+        setPendingAttachments((current) =>
+          current.filter((attachment) => attachment.threadKey !== originThreadKey),
+        );
+        setDraft("");
+        setMentionQuery(null);
+        setSlashQuery(null);
+        setSelectedSkill(null);
+        setSelectedMentions([]);
+        setReplyTarget(null);
+        setAttachmentNotice(null);
+      };
+      if (!plan.shouldSend) {
+        clearOriginComposer();
+        if (reroutedToGroup && groupTarget) {
+          router.push({
+            pathname: "/group-thread",
+            params: {
+              groupId: groupTarget,
+              name: plan.rerouteGroupName ?? "Group",
+            },
+          });
+          return;
+        }
+        if (isCurrentTarget(botTarget, groupTarget)) {
+          await refresh();
+        }
+        return;
+      }
       const artifactIds: string[] = [];
       for (const pending of attachments) {
         const artifact = await rpc<{ id: string }>("artifacts/create", {
-          ...(targetGroupId ? { groupId: targetGroupId } : { botId: targetBotId! }),
+          ...(groupTarget ? { groupId: groupTarget } : { botId: botTarget! }),
           name: pending.name,
           mimeType: pending.mimeType,
           contentBase64: pending.contentBase64,
@@ -515,38 +691,40 @@ export default function Thread() {
       }
       await rpc(
         "threads/send",
-        targetGroupId
+        groupTarget
           ? {
-              groupId: targetGroupId,
-              text: text || undefined,
-              mentions: selectedMentions.length
-                ? selectedMentions.map((member) => member.botId)
-                : undefined,
+              groupId: groupTarget,
+              text: trimmed || undefined,
+              mentions: plan.mentionPayload.length ? plan.mentionPayload : undefined,
               artifactIds: artifactIds.length ? artifactIds : undefined,
-              replyToMessageId: replyTarget?.id,
+              replyToMessageId: reroutedToGroup ? undefined : replyTarget?.id,
             }
           : {
-              botId: targetBotId!,
-              text: text || undefined,
+              botId: botTarget!,
+              text: trimmed || undefined,
+              mentions: plan.mentionPayload.length ? plan.mentionPayload : undefined,
               artifactIds: artifactIds.length ? artifactIds : undefined,
               replyToMessageId: replyTarget?.id,
             },
       );
-      setPendingAttachments((current) =>
-        current.filter((attachment) => attachment.threadKey !== threadKey),
-      );
-      if (isCurrentTarget(targetBotId, targetGroupId)) {
-        setDraft("");
-        setMentionQuery(null);
-        setSlashQuery(null);
-        setSelectedSkill(null);
-        setSelectedMentions([]);
-        setReplyTarget(null);
-        setAttachmentNotice(null);
+      clearOriginComposer();
+      if (reroutedToGroup && groupTarget) {
+        router.push({
+          pathname: "/group-thread",
+          params: {
+            groupId: groupTarget,
+            name: plan.rerouteGroupName ?? "Group",
+          },
+        });
+        return;
+      }
+      if (isCurrentTarget(botTarget, groupTarget)) {
         await refresh();
       }
     } catch (err) {
-      if (isCurrentTarget(targetBotId, targetGroupId)) {
+      if (reroutedToGroup && groupTarget) {
+        setError(err instanceof Error ? err.message : "Failed to send message");
+      } else if (isCurrentTarget(botTarget, groupTarget)) {
         setError(err instanceof Error ? err.message : "Failed to send message");
       }
     } finally {
@@ -615,7 +793,11 @@ export default function Thread() {
           }
           if (
             jumpScrollTarget.current ||
-            (pinnedAroundRef.current && pinnedAroundRef.current.botId === botId)
+            (pinnedAroundRef.current &&
+              ((pinnedAroundRef.current.botId && pinnedAroundRef.current.botId === botId) ||
+                (pinnedAroundRef.current.groupId &&
+                  pinnedAroundRef.current.groupId === groupId))) ||
+            expandedHistoryThread.current === snap?.threadId
           )
             return;
           scroll.current?.scrollToEnd({ animated: false });
@@ -769,6 +951,7 @@ export default function Thread() {
       ) : null}
       {mentionOptions.length ? (
         <View
+          testID="mention-picker"
           style={{
             marginTop: 12,
             borderRadius: 14,
@@ -778,14 +961,31 @@ export default function Thread() {
             overflow: "hidden",
           }}
         >
-          {mentionOptions.map((member) => (
+          {mentionOptions.map((mention) => (
             <Pressable
-              key={member.botId}
-              accessibilityLabel={`Mention ${member.name}`}
-              onPress={() => insertMention(member)}
-              style={{ paddingHorizontal: 14, paddingVertical: 10 }}
+              key={mentionChipKey(mention)}
+              accessibilityLabel={`@${mention.name}`}
+              onPress={() => insertMention(mention)}
+              style={{
+                flexDirection: "row",
+                alignItems: "flex-start",
+                gap: 10,
+                paddingHorizontal: 14,
+                paddingVertical: 10,
+              }}
             >
-              <Text style={{ color: "#ECECEE", fontSize: 14 }}>@{member.name}</Text>
+              <MentionOptionIcon mention={mention} />
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={{ color: "#ECECEE", fontSize: 14 }}>@{mention.name}</Text>
+                {mention.subtitle ? (
+                  <Text
+                    numberOfLines={1}
+                    style={{ color: "#85858A", fontSize: 12.5, marginTop: 2 }}
+                  >
+                    {mention.subtitle}
+                  </Text>
+                ) : null}
+              </View>
             </Pressable>
           ))}
         </View>
@@ -900,9 +1100,9 @@ export default function Thread() {
               </Pressable>
             </View>
           ) : null}
-          {selectedMentions.map((member) => (
+          {selectedMentions.map((mention) => (
             <View
-              key={member.botId}
+              key={mentionChipKey(mention)}
               testID="mention-chip"
               style={{
                 flexDirection: "row",
@@ -915,23 +1115,18 @@ export default function Thread() {
                 maxWidth: "100%",
               }}
             >
-              <View
-                style={{
-                  width: 14,
-                  height: 14,
-                  borderRadius: 4,
-                  backgroundColor: member.color ?? "#85858A",
-                }}
-              />
+              <MentionChipIcon mention={mention} />
               <Text numberOfLines={1} style={{ color: "#ECECEE", fontSize: 13, flexShrink: 1 }}>
-                {member.name}
+                {mention.name}
               </Text>
               <Pressable
-                accessibilityLabel={`Remove mention ${member.name}`}
+                accessibilityLabel={`Remove mention ${mention.name}`}
                 hitSlop={8}
                 onPress={() =>
                   setSelectedMentions((current) =>
-                    current.filter((selected) => selected.botId !== member.botId),
+                    current.filter(
+                      (selected) => mentionChipKey(selected) !== mentionChipKey(mention),
+                    ),
                   )
                 }
               >
@@ -1006,6 +1201,108 @@ export default function Thread() {
   );
 }
 
+function MentionOptionIcon({ mention }: { mention: ComposerMention }) {
+  if (mention.kind === "routine") {
+    return <NativeSymbol ios="clock" android="time-outline" size={16} color="#9A9AA0" />;
+  }
+  if (mention.kind === "connector") {
+    return (
+      <NativeSymbol
+        ios="puzzlepiece.extension"
+        android="extension-puzzle-outline"
+        size={16}
+        color="#9A9AA0"
+      />
+    );
+  }
+  if (mention.kind === "group") {
+    return (
+      <View
+        style={{
+          width: 16,
+          height: 16,
+          borderRadius: 8,
+          backgroundColor: "#2A2A2E",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <Text style={{ color: "#C9C9CE", fontSize: 9 }}>G</Text>
+      </View>
+    );
+  }
+  if (mention.kind === "everyone") {
+    return (
+      <View
+        style={{
+          width: 16,
+          height: 16,
+          borderRadius: 8,
+          backgroundColor: "#2A2A2E",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <Text style={{ color: "#C9C9CE", fontSize: 9 }}>@</Text>
+      </View>
+    );
+  }
+  return (
+    <View
+      style={{
+        width: 16,
+        height: 16,
+        borderRadius: 4,
+        backgroundColor: mention.color ?? "#85858A",
+      }}
+    />
+  );
+}
+
+function MentionChipIcon({ mention }: { mention: ComposerMention }) {
+  if (mention.kind === "routine") {
+    return <NativeSymbol ios="clock" android="time-outline" size={13} color="#B0B0B6" />;
+  }
+  if (mention.kind === "connector") {
+    return (
+      <NativeSymbol
+        ios="puzzlepiece.extension"
+        android="extension-puzzle-outline"
+        size={13}
+        color="#B0B0B6"
+      />
+    );
+  }
+  if (mention.kind === "group" || mention.kind === "everyone") {
+    return (
+      <View
+        style={{
+          width: 14,
+          height: 14,
+          borderRadius: 7,
+          backgroundColor: "#2A2A2E",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <Text style={{ color: "#C9C9CE", fontSize: 9 }}>
+          {mention.kind === "group" ? "G" : "@"}
+        </Text>
+      </View>
+    );
+  }
+  return (
+    <View
+      style={{
+        width: 14,
+        height: 14,
+        borderRadius: 4,
+        backgroundColor: mention.color ?? "#85858A",
+      }}
+    />
+  );
+}
+
 function previewMessageText(message: MobileMessage): string {
   const text = message.blocks
     .flatMap((block) => (block.kind === "text" && block.text ? [block.text] : []))
@@ -1062,6 +1359,7 @@ function MessageBubble({
   onPreviewMarkdown: (target: MarkdownArtifactPreviewTarget) => void;
   onSpeak?: () => void;
 }) {
+  const [peerExpanded, setPeerExpanded] = useState(false);
   const artifactTarget: MobileArtifactTarget = groupId ? { groupId } : { botId };
   const ask = message.blocks.find(
     (block): block is Extract<MessageBlock, { kind: "ask" }> =>
@@ -1079,6 +1377,54 @@ function MessageBubble({
           {handoff.text ? ` · ${handoff.text}` : ""}
         </Text>
       </View>
+    );
+  }
+  const peerMessage = message.blocks.find(
+    (
+      block,
+    ): block is Extract<MessageBlock, { kind: "bot_message_sent" | "bot_message_received" }> =>
+      block.kind === "bot_message_sent" || block.kind === "bot_message_received",
+  );
+  if (peerMessage) {
+    const sent = peerMessage.kind === "bot_message_sent";
+    const peer = sent ? peerMessage.toBotName : peerMessage.fromBotName;
+    // Peer traffic is the bots working, not this conversation, so it stays
+    // collapsed to a line. Mobile has no peer-messages modal yet, so the line
+    // opens in place rather than leaving the text unreachable here.
+    return (
+      <Pressable
+        onPress={() => setPeerExpanded((expanded) => !expanded)}
+        accessibilityRole="button"
+        accessibilityLabel={
+          sent
+            ? peerExpanded
+              ? `Hide message to ${peer}`
+              : `Show message to ${peer}`
+            : peerExpanded
+              ? `Hide message from ${peer}`
+              : `Show message from ${peer}`
+        }
+        style={{ paddingVertical: 4 }}
+      >
+        <Text style={{ color: "#85858A", fontSize: 13.5, textAlign: "center" }}>
+          ↔ {sent ? `Messaged ${peer}` : `Message from ${peer}`}
+        </Text>
+        {peerExpanded ? (
+          <View
+            style={{
+              marginTop: 6,
+              borderRadius: 14,
+              borderWidth: 1,
+              borderColor: "#26262A",
+              backgroundColor: "#101012",
+              paddingHorizontal: 14,
+              paddingVertical: 10,
+            }}
+          >
+            <ChatMarkdown>{peerMessage.text}</ChatMarkdown>
+          </View>
+        ) : null}
+      </Pressable>
     );
   }
   const special = message.blocks.find(

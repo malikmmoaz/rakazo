@@ -1,3 +1,4 @@
+import { Trans } from "@lingui/react/macro";
 import type { SearchHit } from "@rakazo/contracts";
 
 export function WorkspaceSearchResults({
@@ -10,16 +11,24 @@ export function WorkspaceSearchResults({
   onSelect: (hit: SearchHit) => void;
 }) {
   if (loading) {
-    return <div className="px-3 py-4 text-[14px] text-[#85858A]">Searching…</div>;
+    return (
+      <div className="px-3 py-4 text-[14px] text-[#85858A]">
+        <Trans>Searching…</Trans>
+      </div>
+    );
   }
   if (!hits.length) {
-    return <div className="px-3 py-4 text-[14px] text-[#85858A]">No results</div>;
+    return (
+      <div className="px-3 py-4 text-[14px] text-[#85858A]">
+        <Trans>No results</Trans>
+      </div>
+    );
   }
   return (
     <div className="flex flex-col gap-0.5">
       {hits.map((hit) => (
         <button
-          key={`${hit.kind}-${hit.botId}-${hit.messageId ?? hit.artifactId ?? hit.routineId ?? hit.url}`}
+          key={`${hit.kind}-${hit.botId ?? hit.groupId}-${hit.messageId ?? hit.artifactId ?? hit.routineId ?? hit.url}`}
           type="button"
           onClick={() => onSelect(hit)}
           className="rounded-xl px-2.5 py-[11px] text-start hover:bg-[#131315]"
@@ -33,7 +42,7 @@ export function WorkspaceSearchResults({
             </span>
           </div>
           <div className="mt-0.5 truncate text-[13px] text-[#85858A]" dir="auto">
-            {hit.botName} · {hit.snippet}
+            {hit.groupName ?? hit.botName} · {hit.snippet}
           </div>
         </button>
       ))}

@@ -9,6 +9,7 @@ import {
   activeThreadRuns,
   clearActiveThreadRuns,
   computerPanelAutoBoot,
+  computerPanelAutoUsesBoot,
   computerTakeoverBlocked,
   isThreadSnapshotEvent,
   mergeThreadSnapshot,
@@ -205,6 +206,7 @@ describe("thread event reduction", () => {
       taskId: "task-1",
       status: "running",
       trigger: "user",
+      routineId: null,
       modelProvider: null,
       modelId: null,
       error: null,
@@ -261,6 +263,19 @@ describe("thread event reduction", () => {
     );
     expect(progressed?.run?.id).toBe("run-1");
     expect(progressed?.cursor).toBe(4);
+  });
+
+  it("preserves bot_message when event-sourcing a peer run", () => {
+    const started = reduceThreadSnapshot(
+      snapshot([]),
+      event({
+        type: "run.started",
+        runId: "peer-run-1",
+        payload: { trigger: "bot_message" },
+      }),
+    );
+
+    expect(started?.run?.trigger).toBe("bot_message");
   });
 
   it("marks the run as waiting when computer takeover is requested", () => {
@@ -517,6 +532,7 @@ describe("thread event reduction", () => {
         taskId: "task-1",
         status: "running",
         trigger: "user",
+        routineId: null,
         modelProvider: null,
         modelId: null,
         error: null,
@@ -820,6 +836,7 @@ describe("thread event reduction", () => {
       taskId: "task-a",
       status: "running" as const,
       trigger: "user" as const,
+      routineId: null,
       modelProvider: null,
       modelId: null,
       error: null,
@@ -934,6 +951,7 @@ describe("thread event reduction", () => {
       taskId: "task-a",
       status: "running" as const,
       trigger: "user" as const,
+      routineId: null,
       modelProvider: null,
       modelId: null,
       error: null,
@@ -1134,6 +1152,12 @@ describe("computer event reduction", () => {
     expect(computerPanelAutoBoot("booting")).toBe("wait");
     expect(computerPanelAutoBoot("suspended")).toBe("wait");
   });
+
+  it("maps recover-screen to computer.boot, not computer.recover", () => {
+    expect(computerPanelAutoUsesBoot("recover-screen")).toBe(true);
+    expect(computerPanelAutoUsesBoot("boot")).toBe(true);
+    expect(computerPanelAutoUsesBoot("wait")).toBe(false);
+  });
 });
 
 function snapshot(messages: ThreadMessage[], olderCursor: number | null = null): ThreadSnapshot {
@@ -1156,6 +1180,7 @@ function threadRun(id: string, botId = "bot-1"): NonNullable<ThreadSnapshot["run
     taskId: `task-${id}`,
     status: "running",
     trigger: "user",
+    routineId: null,
     modelProvider: null,
     modelId: null,
     error: null,
@@ -1179,6 +1204,7 @@ function computer(overrides: Partial<ComputerStatus> = {}): ComputerStatus {
     screenHeight: 800,
     homeRevision: null,
     busyBotName: null,
+    updateAvailable: true,
     ...overrides,
   };
 }

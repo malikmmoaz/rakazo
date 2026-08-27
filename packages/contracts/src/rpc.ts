@@ -24,7 +24,6 @@ import {
   CreateScratchpadItemInput,
   DeploymentSettingsSchema,
   ExportManifestSchema,
-  GROUP_MEMBER_MAX,
   GroupDetailSchema,
   GroupSchema,
   McpServerConfigInput,
@@ -56,6 +55,7 @@ import {
 } from "./domain.js";
 import { ProductEventSchema } from "./events.js";
 import { Id } from "./ids.js";
+import { RunsListOutputSchema } from "./runs.js";
 import { SearchQueryOutputSchema } from "./search.js";
 
 const botId = z.object({ botId: Id });
@@ -78,11 +78,22 @@ const threadTarget = z
     }
   });
 
+const structuredMentionTarget = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("bot"), id: Id }),
+  z.object({ kind: z.literal("group"), id: Id }),
+  z.object({ kind: z.literal("routine"), id: Id }),
+  z.object({ kind: z.literal("connector"), id: Id }),
+]);
+
 const threadSendInput = threadTarget
   .safeExtend({
     text: z.string().optional(),
     artifactIds: z.array(Id).max(ATTACHMENT_MAX_COUNT).optional(),
-    mentions: z.array(Id).max(GROUP_MEMBER_MAX).optional(),
+    /** Bare bot ids (legacy) or typed mention chips from the composer. */
+    mentions: z
+      .array(z.union([Id, structuredMentionTarget]))
+      .max(64)
+      .optional(),
     replyToMessageId: Id.optional(),
     clientNonce: z.string().min(1).max(200).optional(),
   })
@@ -229,6 +240,9 @@ export const appContract = {
     status: oc.input(botId).output(ComputerStatusSchema),
     boot: oc.input(botId).output(ComputerStatusSchema),
     stop: oc.input(botId).output(ComputerStatusSchema),
+    recover: oc.input(botId).output(ComputerStatusSchema),
+    reset: oc.input(botId).output(ComputerStatusSchema),
+    update: oc.input(botId).output(ComputerStatusSchema),
     takeover: oc.input(botId).output(z.object({ leaseId: Id, expiresAt: z.string() })),
     release: oc
       .input(
@@ -291,7 +305,7 @@ export const appContract = {
           routineId: Id,
           name: z.string().optional(),
           prompt: z.string().optional(),
-          cron: z.string().optional(),
+          crons: z.array(z.string().min(1)).min(1).optional(),
           timezone: z.string().optional(),
           active: z.boolean().optional(),
           notify: z.boolean().optional(),
@@ -299,7 +313,14 @@ export const appContract = {
       )
       .output(RoutineSchema),
     remove: oc.input(z.object({ routineId: Id })).output(z.object({ ok: z.literal(true) })),
-    testRun: oc.input(z.object({ routineId: Id })).output(z.object({ runId: Id })),
+    testRun: oc
+      .input(
+        z.object({
+          routineId: Id,
+          clientNonce: z.string().min(1).max(200).optional(),
+        }),
+      )
+      .output(z.object({ runId: Id })),
   },
   scratchpad: {
     list: oc
@@ -513,6 +534,9 @@ export const appContract = {
   },
   search: {
     query: oc.input(z.object({ q: z.string().max(200) })).output(SearchQueryOutputSchema),
+  },
+  runs: {
+    list: oc.input(z.object({ filter: z.enum(["active", "recent"]) })).output(RunsListOutputSchema),
   },
   voice: {
     catalog: oc.output(z.array(VoiceCatalogEntrySchema)),

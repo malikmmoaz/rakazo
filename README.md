@@ -99,6 +99,12 @@ setup again.
 
 Mobile build and release instructions live in [docs/mobile-release.md](./docs/mobile-release.md).
 
+## Web UI language
+
+The web (and Electron-hosted) UI supports English, Deutsch, and 한국어. Change it under
+**Settings → Language**. The marketing homepage (`apps/www`) is available in en/de/ko via
+footer language links (`/`, `/de/`, `/ko/`); other marketing pages stay English.
+
 ## Development
 
 Rakazo is a TypeScript monorepo built with React, Electron, Expo, Hono, Postgres, Prisma, Graphile

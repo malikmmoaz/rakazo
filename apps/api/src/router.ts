@@ -25,6 +25,7 @@ import {
   type ComputerExecutionLease,
   type ConnectorRegistry,
   checkpointAndRecordComputerWorkspace,
+  computerSupportsUpdate,
   createVoiceProvider,
   destroyBot,
   displayBotWorkspacePath,
@@ -47,6 +48,7 @@ import {
   provisionComputer,
   type RemoteConnectorDependencies,
   releaseComputerExecutionLease,
+  replaceComputer,
   resolveBotWorkspacePath,
   sanitizeComposioError,
   savePushToken,
@@ -75,8 +77,9 @@ import {
   AttachmentValidationError,
   containsSecret,
   expandSkillReferencesInPrompt,
-  isOneShotRoutineCron,
-  nextCronDate,
+  hasMixedOneShotSchedule,
+  isOneShotRoutineCrons,
+  nextCronDateAcrossStrict,
 } from "@rakazo/core";
 import {
   appendEventInTransaction,
@@ -105,6 +108,7 @@ import {
 } from "./computer-status.js";
 import { buildMcpUpdateMaterial } from "./mcp-material.js";
 import { chooseFocus, markAppConnected, startOnboarding } from "./onboarding.js";
+import { listWorkspaceRuns } from "./runs.js";
 import { addScreenProxyCapability } from "./screen-proxy.js";
 import { queryWorkspaceSearch } from "./search.js";
 import { withSerializableRetry } from "./serializable-retry.js";
@@ -1112,6 +1116,15 @@ export function createRouter(deps: RouterDeps) {
         );
         return computerStatus(deps, context.actor, input.botId);
       }),
+      recover: authed.computer.recover.handler(async ({ context, input }) =>
+        runComputerReplace(deps, context, input.botId, "recover", "recover"),
+      ),
+      reset: authed.computer.reset.handler(async ({ context, input }) =>
+        runComputerReplace(deps, context, input.botId, "reset", "reset"),
+      ),
+      update: authed.computer.update.handler(async ({ context, input }) =>
+        runComputerReplace(deps, context, input.botId, "update", "update"),
+      ),
       takeover: authed.computer.takeover.handler(async ({ context, input }) => {
         let bot = await repos.getBot(context.actor, input.botId);
         if (!bot.computer?.providerRef || bot.computer.state !== "running") {
@@ -1193,6 +1206,7 @@ export function createRouter(deps: RouterDeps) {
         const granted = await deps.prisma.computer.updateMany({
           where: {
             id: bot.computer.id,
+            state: "running",
             controlHolder: { not: "user" },
             controlLeaseId: null,
           },
@@ -1556,16 +1570,21 @@ export function createRouter(deps: RouterDeps) {
         return listRoutinesDto(deps, context.actor, input.botId);
       }),
       create: authed.routines.create.handler(async ({ context, input }) => {
-        if (input.active && isOneShotRoutineCron(input.cron)) {
+        if (hasMixedOneShotSchedule(input.crons)) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "A one-time schedule can't be combined with other schedules.",
+          });
+        }
+        if (input.active && isOneShotRoutineCrons(input.crons)) {
           throw new ORPCError("BAD_REQUEST", {
             message: "One-shot schedules must be created from chat.",
           });
         }
         const bot = await repos.getBot(context.actor, input.botId);
-        // Validate recurring cron even when inactive; @once has no next date.
+        // Validate every recurring cron even when inactive; @once has no next date.
         let nextRunAt: Date | null = null;
-        if (!isOneShotRoutineCron(input.cron)) {
-          const computedNextRunAt = nextRoutineDate(input.cron, input.timezone);
+        if (!isOneShotRoutineCrons(input.crons)) {
+          const computedNextRunAt = nextRoutineDate(input.crons, input.timezone);
           nextRunAt = input.active ? computedNextRunAt : null;
         }
         const row = await deps.prisma.routine.create({
@@ -1575,7 +1594,7 @@ export function createRouter(deps: RouterDeps) {
             userId: context.actor.userId,
             name: input.name,
             prompt: input.prompt,
-            cron: input.cron,
+            crons: input.crons,
             timezone: input.timezone,
             notify: input.notify,
             active: input.active,
@@ -1606,10 +1625,15 @@ export function createRouter(deps: RouterDeps) {
         });
         if (!existing) throw new IsolationError();
         const active = input.active ?? existing.active;
-        const cron = input.cron ?? existing.cron;
+        const crons = input.crons ?? existing.crons;
         const timezone = input.timezone ?? existing.timezone;
-        if (active && isOneShotRoutineCron(cron)) {
-          if (!isOneShotRoutineCron(existing.cron)) {
+        if (hasMixedOneShotSchedule(crons)) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "A one-time schedule can't be combined with other schedules.",
+          });
+        }
+        if (active && isOneShotRoutineCrons(crons)) {
+          if (!isOneShotRoutineCrons(existing.crons)) {
             throw new ORPCError("BAD_REQUEST", {
               message: "One-shot schedules must be created from chat.",
             });
@@ -1622,15 +1646,16 @@ export function createRouter(deps: RouterDeps) {
         }
         const scheduleChanged =
           (!existing.active && active) ||
-          (input.cron !== undefined && input.cron !== existing.cron) ||
+          (input.crons !== undefined &&
+            JSON.stringify(input.crons) !== JSON.stringify(existing.crons)) ||
           (input.timezone !== undefined && input.timezone !== existing.timezone);
         const recalculatedNextRunAt =
-          !isOneShotRoutineCron(cron) && (scheduleChanged || (active && !existing.nextRunAt))
-            ? nextRoutineDate(cron, timezone)
+          !isOneShotRoutineCrons(crons) && (scheduleChanged || (active && !existing.nextRunAt))
+            ? nextRoutineDate(crons, timezone)
             : null;
         const nextRunAt = !active
           ? null
-          : isOneShotRoutineCron(cron)
+          : isOneShotRoutineCrons(crons)
             ? existing.nextRunAt
             : (recalculatedNextRunAt ?? existing.nextRunAt);
         const row = await deps.prisma.routine.update({
@@ -1638,7 +1663,7 @@ export function createRouter(deps: RouterDeps) {
           data: {
             name: input.name,
             prompt: input.prompt,
-            cron: input.cron,
+            crons: input.crons,
             timezone: input.timezone,
             active: input.active,
             notify: input.notify,
@@ -1679,35 +1704,77 @@ export function createRouter(deps: RouterDeps) {
       }),
       testRun: authed.routines.testRun.handler(async ({ context, input }) => {
         const routine = await deps.prisma.routine.findFirst({
-          where: { id: input.routineId, workspaceId: context.actor.workspaceId },
+          where: {
+            id: input.routineId,
+            workspaceId: context.actor.workspaceId,
+            userId: context.actor.userId,
+          },
         });
         if (!routine) throw new IsolationError();
         const bot = await repos.getBot(context.actor, routine.botId);
         if (!bot.thread) throw new IsolationError();
+        const threadId = bot.thread.id;
+        const nonce = input.clientNonce ? `routine-test:${input.clientNonce}` : undefined;
+        if (nonce) {
+          const existing = await deps.prisma.run.findFirst({
+            where: { threadId, clientNonce: nonce },
+            select: { id: true },
+          });
+          if (existing) return { runId: existing.id };
+        }
         const skillRecords = await agentSkills.listWithContent(context.actor);
         const prompt = expandSkillReferencesInPrompt(routine.prompt, skillRecords);
-        const task = await deps.prisma.task.create({
-          data: {
-            workspaceId: context.actor.workspaceId,
-            botId: bot.id,
-            threadId: bot.thread.id,
-            userId: context.actor.userId,
-            prompt,
-            status: "queued",
-          },
+        let run: { id: string };
+        try {
+          // Task + run must commit together so a nonce collision cannot leave an orphan queued Task.
+          run = await deps.prisma.$transaction(async (tx) => {
+            if (nonce) {
+              const existing = await tx.run.findFirst({
+                where: { threadId, clientNonce: nonce },
+                select: { id: true },
+              });
+              if (existing) return existing;
+            }
+            const task = await tx.task.create({
+              data: {
+                workspaceId: context.actor.workspaceId,
+                botId: bot.id,
+                threadId,
+                userId: context.actor.userId,
+                prompt,
+                status: "queued",
+              },
+            });
+            return tx.run.create({
+              data: {
+                workspaceId: context.actor.workspaceId,
+                botId: bot.id,
+                threadId,
+                taskId: task.id,
+                userId: context.actor.userId,
+                status: "queued",
+                trigger: "routine",
+                routineId: routine.id,
+                clientNonce: nonce,
+              },
+              select: { id: true },
+            });
+          });
+        } catch (error) {
+          if (nonce) {
+            const existing = await deps.prisma.run.findFirst({
+              where: { threadId, clientNonce: nonce },
+              select: { id: true },
+            });
+            if (existing) return { runId: existing.id };
+          }
+          throw error;
+        }
+        // Keep enqueue outside the nonce-collision catch. The queued run is durable;
+        // log enqueue failures and still return success — the reconciler repairs a missed wake.
+        await deps.jobs.enqueue(runContinueJob(run.id)).catch((error) => {
+          console.error("routine testRun enqueue", error);
         });
-        const run = await deps.prisma.run.create({
-          data: {
-            workspaceId: context.actor.workspaceId,
-            botId: bot.id,
-            threadId: bot.thread.id,
-            taskId: task.id,
-            userId: context.actor.userId,
-            status: "queued",
-            trigger: "routine",
-          },
-        });
-        await deps.jobs.enqueue(runContinueJob(run.id));
         return { runId: run.id };
       }),
     },
@@ -2714,7 +2781,7 @@ export function createRouter(deps: RouterDeps) {
           routines: routines.map((r) => ({
             name: r.name,
             prompt: r.prompt,
-            cron: r.cron,
+            crons: r.crons,
             timezone: r.timezone,
           })),
           files,
@@ -2731,6 +2798,11 @@ export function createRouter(deps: RouterDeps) {
     search: {
       query: authed.search.query.handler(async ({ context, input }) => ({
         hits: await queryWorkspaceSearch(deps.prisma, context.actor, input.q),
+      })),
+    },
+    runs: {
+      list: authed.runs.list.handler(async ({ context, input }) => ({
+        runs: await listWorkspaceRuns(deps.prisma, context.actor, input.filter),
       })),
     },
     voice: {
@@ -2858,6 +2930,52 @@ async function computerStatus(
     botName: bot.name,
   });
   return toComputerStatus(botId, bot.computer, busyBotName);
+}
+
+async function runComputerReplace(
+  deps: RouterDeps,
+  context: { actor: Actor },
+  botId: string,
+  mode: "recover" | "reset" | "update",
+  operationId: string,
+): Promise<ComputerStatus> {
+  const repos = createRepos(deps.prisma);
+  const bot = await repos.getBot(context.actor, botId);
+  if (!bot.computer) throw new IsolationError();
+  if (mode === "update" && !computerSupportsUpdate(bot.computer.kind)) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Computer update is not available on this device",
+    });
+  }
+  const manualRunId = `${mode}:${randomUUID()}`;
+  let lease: ComputerExecutionLease | null;
+  try {
+    lease = await acquireComputerExecutionLease(deps.prisma, {
+      computerId: bot.computer.id,
+      runId: manualRunId,
+      botId: bot.id,
+    });
+  } catch (error) {
+    if (error instanceof ComputerBusyError) {
+      throw new ORPCError("CONFLICT", { message: "Computer is busy" });
+    }
+    throw error;
+  }
+  try {
+    await replaceComputer(deps, bot.computer.id, mode, {
+      ...computerContext(context.actor, bot.id, operationId),
+      screenLeaseId: screenLeaseIdForRun(lease, manualRunId),
+    });
+    scheduleComputerSleep(deps.jobs, bot.computer.id);
+  } catch (error) {
+    if (error instanceof ComputerBusyError) {
+      throw new ORPCError("CONFLICT", { message: "Computer is busy" });
+    }
+    throw error;
+  } finally {
+    await releaseComputerExecutionLease(deps.prisma, lease);
+  }
+  return computerStatus(deps, context.actor, botId);
 }
 
 async function expireStaleComputerControl(
@@ -3114,12 +3232,15 @@ function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw signal.reason ?? new Error("Request cancelled");
 }
 
-function nextRoutineDate(cron: string, timezone: string): Date {
+function nextRoutineDate(crons: string[], timezone: string): Date {
+  let next: Date | null;
   try {
-    return nextCronDate(cron, new Date(), timezone);
+    next = nextCronDateAcrossStrict(crons, new Date(), timezone);
   } catch {
     throw new ORPCError("BAD_REQUEST", { message: "Enter a valid cron expression." });
   }
+  if (!next) throw new ORPCError("BAD_REQUEST", { message: "Enter a valid cron expression." });
+  return next;
 }
 
 function mapRoutine(row: {
@@ -3127,7 +3248,7 @@ function mapRoutine(row: {
   botId: string;
   name: string;
   prompt: string;
-  cron: string;
+  crons: string[];
   timezone: string;
   active: boolean;
   notify: boolean;
@@ -3140,7 +3261,7 @@ function mapRoutine(row: {
     botId: row.botId,
     name: row.name,
     prompt: row.prompt,
-    cron: row.cron,
+    crons: row.crons,
     timezone: row.timezone,
     active: row.active,
     notify: row.notify,
